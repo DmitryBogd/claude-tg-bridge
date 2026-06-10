@@ -1,0 +1,24 @@
+# Secrets — NEVER commit
+.env
+
+# Runtime state (created at runtime by the daemon/scripts)
+offset
+offset.fallback
+daemon.pid
+poll.lock/
+pending/
+answers/
+sessions/
+inbox/
+parked/
+msgmap/
+away
+
+# Logs
+*.log
+
+# Project tg-mode flags
+projects/
+
+# macOS
+.DS_Store

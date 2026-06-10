@@ -1,0 +1,76 @@
+{
+  "hooks": {
+    "PermissionRequest": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$HOME/.claude/tg-hitl/tg-permission.sh\"",
+            "timeout": 300,
+            "statusMessage": "Waiting for permission confirmation in Telegram (away mode)"
+          }
+        ]
+      }
+    ],
+    "Notification": [
+      {
+        "matcher": "permission_prompt|idle_prompt",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "in=$(cat); m=$(printf '%s' \"$in\" | jq -r '.message // \"needs attention\"'); d=$(printf '%s' \"$in\" | jq -r '.cwd // \"\"'); \"$HOME/.claude/tg-hitl/tg-ask.sh\" --notify \"[$(basename \"$d\")] $m\" 2>/dev/null || true",
+            "timeout": 20,
+            "async": true
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$HOME/.claude/tg-hitl/tg-session.sh\" start",
+            "timeout": 10,
+            "async": true
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$HOME/.claude/tg-hitl/tg-session.sh\" beat",
+            "timeout": 10,
+            "async": true
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$HOME/.claude/tg-hitl/tg-session.sh\" stop",
+            "timeout": 1800
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$HOME/.claude/tg-hitl/tg-session.sh\" end",
+            "timeout": 10,
+            "async": true
+          }
+        ]
+      }
+    ]
+  }
+}
