@@ -16,7 +16,8 @@ SESSIONS="$DIR/sessions"
 INBOX="$DIR/inbox"
 PARKED="$DIR/parked"
 MSGMAP="$DIR/msgmap"
-mkdir -p "$SESSIONS" "$INBOX" "$PARKED" "$MSGMAP"
+LASTMIRROR="$DIR/lastmirror"   # хеш останньої здзеркаленої відповіді на сесію (дедуп)
+mkdir -p "$SESSIONS" "$INBOX" "$PARKED" "$MSGMAP" "$LASTMIRROR"
 [ -f "$DIR/.env" ] && . "$DIR/.env"
 API="https://api.telegram.org/bot${TG_TOKEN:-}"
 
@@ -110,7 +111,7 @@ take_inbox() {
 case "$event" in
   start) write_entry "$now" ;;
   beat)  beat ;;
-  end)   rm -f "$f" "$inbox" "$PARKED/$sid" ;;
+  end)   rm -f "$f" "$inbox" "$PARKED/$sid" "$LASTMIRROR/$sid" ;;
   stop)
     beat
     # 1) Уже є повідомлення в черзі (надіслане, поки сесія працювала) — доставити.
@@ -121,16 +122,31 @@ case "$event" in
     # 2) Поза tg-режимом — звичайна зупинка.
     tg_mode_on || exit 0
     # 3) tg-режим: дзеркалю відповідь у TG і паркуюсь, чекаючи твоє повідомлення.
-    rep=$(last_reply)
+    # Дочекатись НОВОЇ відповіді. На ходах після інжекції (decision:block) продовжена
+    # відповідь ще не в транскрипті в момент Stop → last_reply спершу віддає стару.
+    # PARK_SECS + 15 ≤ Stop-timeout (1800с у settings.json) — залежність, не ламати.
+    prevh=$(cat "$LASTMIRROR/$sid" 2>/dev/null || echo "")
+    rep=""; newh=""
+    for _w in $(seq 1 15); do
+      cand=$(last_reply)
+      if [ -n "$cand" ]; then
+        h=$(printf '%s' "$cand" | cksum | tr -d ' ')
+        if [ "$h" != "$prevh" ]; then rep="$cand"; newh="$h"; break; fi
+      fi
+      sleep 1
+    done
     echo $$ > "$PARKED/$sid"            # pid — щоб демон бачив, що парк живий
     trap 'rm -f "$PARKED/$sid"' EXIT
     if [ -n "$rep" ]; then
+      printf '%s' "$newh" > "$LASTMIRROR/$sid"
       mid=$(send_id "💬 $name:
 
 $rep
 
 ↩️ Щоб продовжити розмову — відповідай саме на ЦЕ повідомлення.")
     else
+      # Відповідь не з'явилась у транскрипті за 15с (injection-хід, повільний flush) —
+      # нейтральне запрошення без стале-тексту (краще за показ попередньої відповіді).
       mid=$(send_id "💬 $name завершив крок і чекає на тебе.
 ↩️ Щоб продовжити — відповідай саме на ЦЕ повідомлення.")
     fi
