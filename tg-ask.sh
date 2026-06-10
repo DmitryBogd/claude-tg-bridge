@@ -1,5 +1,5 @@
 #!/bin/bash
-# tg-ask.sh — human-in-the-loop через Telegram (бот @important_decisions_bot).
+# tg-ask.sh — human-in-the-loop через Telegram.
 #
 #   tg-ask.sh --notify "текст"          надіслати сповіщення, не чекати відповіді
 #   tg-ask.sh "питання" [timeout_sec]   надіслати питання і чекати відповіді

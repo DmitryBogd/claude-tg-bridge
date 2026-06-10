@@ -42,7 +42,7 @@ answer routing is via Telegram reply-to (message_id → msgmap/ lookup).
 
 ## Requirements
 
-- macOS (launchd for auto-start; the scripts themselves work on any bash 4+ system)
+- macOS (uses launchd for auto-start; the scripts themselves run on any Linux/macOS with bash 4+, but the installer and daemon auto-restart are macOS-only)
 - `bash`, `curl`, `jq`
 - A Telegram bot token (`@BotFather`) + your personal chat ID
 
