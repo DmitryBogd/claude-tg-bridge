@@ -17,10 +17,16 @@ away from the computer.
   "ні/no/-" to deny. Silence for 4 min → falls back to the normal local dialog.
 
 - **Session park** — when tg-mode is active, after each Claude turn the `Stop` hook
-  mirrors the assistant's last reply to Telegram and parks, waiting for your
-  message. Reply via Telegram to inject it into the session and continue.
+  mirrors the assistant's **final** reply to Telegram (it waits for the transcript
+  to flush and skips intermediate status texts — a text is "final" only if no
+  tool_use follows it) and parks, waiting for your message. Reply via Telegram to
+  inject it into the session and continue; replying to the same anchor twice works,
+  and you can address any session without a reply via a `#s<first 8 hex of id>` tag.
 
-- **`/sessions`** — bot command listing all active Claude sessions with their IDs.
+- **`/sessions`** — bot command listing all active Claude sessions with live status:
+  🟢 working (turn in progress, by transcript mtime) · 😴 parked, waiting for your
+  reply · ✅ finished its turn N min ago · 🟡 possibly interrupted (Esc fires no
+  `Stop` event, so the state can go stale).
 
 ## Architecture
 
@@ -30,8 +36,11 @@ Telegram ──→ tg-daemon.sh (permanent long-poll, launchd KeepAlive)
                 ├─ routes replies to → answers/<qid>   (tg-ask.sh waits here)
                 └─ routes messages to → inbox/<sid>    (tg-session.sh park picks up)
 
-tg-ask.sh      blocks polling answers/<qid>; fallback self-poll if daemon is down
-tg-session.sh  SessionStart/Stop/End hooks; park loop; mirrors last reply to TG
+tg-ask.sh      blocks polling answers/<qid>; if the daemon is down it first tries a
+               launchd kickstart, and only then self-polls (routing session replies
+               too — advancing the shared getUpdates offset must never drop them)
+tg-session.sh  SessionStart/Stop/End hooks; session state registry; park loop with
+               mtime heartbeat; mirrors the FINAL reply to TG
 tg-permission.sh  PermissionRequest hook; calls tg-ask with 240 s timeout
 tg-mode.sh     per-project on/off toggle for tg-mode
 ```

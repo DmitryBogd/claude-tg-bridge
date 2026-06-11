@@ -27,9 +27,10 @@ if [ ! -f "$DIR/away" ] && { [ -z "$cwd" ] || [ ! -f "$projflag" ]; }; then
 fi
 
 tool=$(printf '%s' "$in" | jq -r '.tool_name // "?"')
+# Зріз у jq за КОДПОЇНТАМИ: head -c різав UTF-8 посеред символа → невалідний
+# текст → Telegram 400 → питання про дозвіл мовчки не доходило.
 detail=$(printf '%s' "$in" | jq -r \
-  '.tool_input.command // .tool_input.file_path // (.tool_input | tostring) // ""' \
-  | head -c 400)
+  '(.tool_input.command // .tool_input.file_path // (.tool_input | tostring) // "") | .[0:400]')
 
 ans=$("$DIR/tg-ask.sh" "🔐 [$proj] Запит дозволу: $tool
 $detail
