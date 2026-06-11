@@ -138,6 +138,17 @@ tail -f ~/.claude/tg-hitl/daemon.log
 ~/.claude/tg-hitl/tg-mode.sh status
 ```
 
+## Known limitations
+
+- **Two-reader `getUpdates` window.** While the daemon is being restarted and a
+  `tg-ask` fallback poller is active, both may briefly call `getUpdates`; Telegram
+  confirms updates by the highest offset seen, so one reader can in principle
+  confirm a batch the other never processed. Mitigated (daemon-dead gate,
+  kickstart-first, offset advanced only after routing) but not hard-interlocked.
+- Sessions opened **before** the hooks were installed are not in the registry
+  (Claude Code snapshots hook config at session start) — restart them or re-apply
+  via `/hooks`.
+
 ## Security notes
 
 - `.env` contains the bot token — keep it `chmod 600`, never commit it.

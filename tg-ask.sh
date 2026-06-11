@@ -24,7 +24,13 @@ export LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8
 
 DIR="${TG_HITL_DIR:-$(cd "$(dirname "$0")" && pwd)}"
 # shellcheck source=/dev/null
-source "$DIR/.env"
+[ -f "$DIR/.env" ] && source "$DIR/.env"
+# Без конфігу — чесний exit 124 (як «без відповіді»): caller'и падають у свій
+# fallback-діалог замість крашу «unbound variable» під set -u.
+if [ -z "${TG_TOKEN:-}" ] || [ -z "${TG_CHAT_ID:-}" ]; then
+  echo "NO_RESPONSE: TG_TOKEN/TG_CHAT_ID не задані в $DIR/.env" >&2
+  exit 124
+fi
 API="${TG_API_BASE:-https://api.telegram.org}/bot${TG_TOKEN}"
 PENDING="$DIR/pending"
 ANSWERS="$DIR/answers"
@@ -121,7 +127,7 @@ match_session() {
 }
 
 route_updates() {
-  local resp="$1" n i text reply reply_mid spec qid sid8 full target
+  local resp="$1" n i text reply reply_mid spec qid sid8 tsid full target
   n=$(jq '.result | length' <<<"$resp") || return
   for ((i = 0; i < n; i++)); do
     text=$(jq -r --arg cid "$TG_CHAT_ID" \
@@ -139,9 +145,9 @@ route_updates() {
                printf '%s' "$text" > "$ANSWERS/$qid.tmp" && mv "$ANSWERS/$qid.tmp" "$ANSWERS/$qid"
                rm -f "$PENDING/$qid"
              fi; continue ;;
-        s:*) sid8=${spec#s:}
-             if [ -f "$SESSIONS/$sid8" ]; then
-               printf '%s\n' "$text" >> "$INBOX/$sid8"
+        s:*) tsid=${spec#s:}
+             if [ -f "$SESSIONS/$tsid" ]; then
+               printf '%s\n' "$text" >> "$INBOX/$tsid"
                send "✉️ отримано — доставлю сесії на наступному кроці."
              fi; continue ;;
       esac
@@ -210,9 +216,11 @@ while [ "$(date +%s)" -lt "$DEADLINE" ]; do
   OFFSET=$(cat "$OFFSET_FILE" 2>/dev/null || echo "")
   RESP=$(curl -s --max-time 35 \
     "$API/getUpdates?timeout=25${OFFSET:+&offset=$OFFSET}" 2>/dev/null || echo '{}')
+  route_updates "$RESP"
+  # offset ПІСЛЯ розкладання (at-least-once, як у демона): крах посеред
+  # маршрутизації → батч перечитається, а не «підтверджено й втрачено».
   MAXID=$(jq -r '.result[-1].update_id // empty' <<<"$RESP" 2>/dev/null)
   [ -n "$MAXID" ] && echo $((MAXID + 1)) > "$OFFSET_FILE"
-  route_updates "$RESP"
   rm -f "$LOCK/pid"
   rmdir "$LOCK" 2>/dev/null
   trap cleanup EXIT

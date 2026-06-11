@@ -21,7 +21,13 @@ export LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8
 
 DIR="${TG_HITL_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
 # shellcheck source=/dev/null
-source "$DIR/.env"
+[ -f "$DIR/.env" ] && source "$DIR/.env"
+# Без конфігу — гучний вихід у лог (launchd перезапустить за ThrottleInterval),
+# а не краш «unbound variable» під set -u у першому ж curl.
+if [ -z "${TG_TOKEN:-}" ] || [ -z "${TG_CHAT_ID:-}" ]; then
+  echo "tg-daemon: TG_TOKEN/TG_CHAT_ID не задані в $DIR/.env — виходжу" >&2
+  return 1 2>/dev/null || exit 1
+fi
 API="${TG_API_BASE:-https://api.telegram.org}/bot${TG_TOKEN}"
 PENDING="$DIR/pending"
 ANSWERS="$DIR/answers"
@@ -184,7 +190,7 @@ confirm_session() {
 # msgmap-записи s:* НЕ видаляються після використання (повторний реплай на той
 # самий якір має працювати); чистка — періодична, за віком.
 handle() {
-  local text="$1" reply="$2" reply_mid="$3" spec qid sid8 full nq parks np phit cleaned
+  local text="$1" reply="$2" reply_mid="$3" spec qid sid8 tsid full nq parks np phit cleaned
   case "$text" in
     /sessions*) list_sessions; return ;;
     /help*)
@@ -204,8 +210,8 @@ handle() {
       q:*) qid=${spec#q:}
            if [ -f "$PENDING/$qid" ]; then deliver_answer "$qid" "$text"
            else say "Те питання вже неактуальне."; fi; return ;;
-      s:*) sid8=${spec#s:}
-           if [ -f "$SESSIONS/$sid8" ]; then deliver_to_session "$sid8" "$text"; confirm_session "$sid8"
+      s:*) tsid=${spec#s:}   # повний sid із msgmap
+           if [ -f "$SESSIONS/$tsid" ]; then deliver_to_session "$tsid" "$text"; confirm_session "$tsid"
            else say "Та сесія вже закрита — доставити нікуди."; fi; return ;;
     esac
   fi
@@ -248,12 +254,18 @@ handle() {
 # ── Для юніт-тестів: визначити функції й не запускати рантайм. ──
 [ "${TG_DAEMON_TEST:-0}" = "1" ] && return 0 2>/dev/null
 
-# Один інстанс. Живість конкурента — за heartbeat (kill -0 бреше при pid-reuse:
-# мертвий «демон» назавжди блокував би старт нового, а апдейти Telegram викидає
-# через 24 год — реальна втрата).
+# Один інстанс. «Уже працює» = свіжий heartbeat І живий pid із PIDFILE.
+# Сам лише свіжий beat НЕ доказ життя: після kickstart -k (SIGKILL без trap)
+# beat лишається свіжим ≤120с і блокував би заміну — реальний простій на кожному
+# рестарті. Сам лише kill -0 теж бреше (pid-reuse). Разом — надійно, і обидві
+# хиби самозцілюються: beat протухає, reuse-pid не тримає beat свіжим.
 if [ -f "$BEAT" ] && [ $(( $(date +%s) - $(stat -f %m "$BEAT" 2>/dev/null || echo 0) )) -le 120 ]; then
-  echo "tg-daemon already running (beat fresh)" >&2
-  exit 0
+  old=$(cat "$PIDFILE" 2>/dev/null || echo "")
+  if [ -n "$old" ] && kill -0 "$old" 2>/dev/null; then
+    echo "tg-daemon already running (pid $old, beat fresh)" >&2
+    exit 0
+  fi
+  # beat свіжий, але процеса немає — попередника вбили; перебираємо негайно.
 fi
 if [ ! -f "$BEAT" ] && [ -f "$PIDFILE" ]; then
   old=$(cat "$PIDFILE" 2>/dev/null || echo "")
