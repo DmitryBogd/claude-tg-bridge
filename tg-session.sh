@@ -21,7 +21,8 @@ INBOX="$DIR/inbox"
 PARKED="$DIR/parked"
 MSGMAP="$DIR/msgmap"
 LASTMIRROR="$DIR/lastmirror"   # hash of the last mirrored reply per session (dedup)
-mkdir -p "$SESSIONS" "$INBOX" "$PARKED" "$MSGMAP" "$LASTMIRROR"
+OUTBOX="$DIR/outbox"           # undelivered TG messages — the daemon resends them
+mkdir -p "$SESSIONS" "$INBOX" "$PARKED" "$MSGMAP" "$LASTMIRROR" "$OUTBOX"
 [ -f "$DIR/.env" ] && . "$DIR/.env"
 API="${TG_API_BASE:-https://api.telegram.org}/bot${TG_TOKEN:-}"
 
@@ -85,14 +86,34 @@ save_session() {
 }
 
 # ── Telegram ──────────────────────────────────────────────────────────────────
-tg() {  # send plain text to TG (best-effort)
-  [ -n "${TG_TOKEN:-}" ] || return 0
-  curl -s --max-time 15 -X POST "$API/sendMessage" \
-    --data-urlencode "chat_id=${TG_CHAT_ID}" \
-    --data-urlencode "text=$1" >/dev/null 2>&1 || true
+# A send failure must NOT lose the message (incident 2026-06-12: send_id failed
+# all 3 attempts during a transient outage — the turn's final reply vanished with
+# no log and no retry). The text drops into outbox/<epoch>.<sid|->.<pid> (tmp+mv —
+# atomic against the daemon reading it); the daemon flushes the queue every
+# iteration once Telegram is reachable again ("📬 delayed…"; for sid≠- it also
+# writes a msgmap anchor — a reply routes as usual).
+spool() {  # $1=sid or "-" (no anchor)  $2=text  $3=last API response (for the log)
+  # $RANDOM suffix: one hook can spool twice within a second (tg + mirror) —
+  # without it the second mv would silently overwrite the first file (the very
+  # loss class this fix eliminates).
+  local tmpf="$OUTBOX/.tmp.$$.$RANDOM"
+  printf '%s' "$2" > "$tmpf" 2>/dev/null && mv "$tmpf" "$OUTBOX/$(date +%s).${1:--}.$$.$RANDOM"
+  printf '%s spool→outbox (sid=%s len=%s): %.200s\n' "$(date '+%F %T')" "$1" "${#2}" \
+    "$(jq -rc '{error_code,description}' <<<"${3:-}" 2>/dev/null || printf '%s' "${3:-}")" \
+    >> "$DIR/daemon.log"
 }
-# send and return the message_id; 3 attempts. Failure → return 1 (do NOT park
-# for the full window without an anchor: there would be nothing to reply to).
+tg() {  # send plain text to TG; on failure → outbox (the daemon will resend)
+  [ -n "${TG_TOKEN:-}" ] || return 0
+  local resp
+  resp=$(curl -s --max-time 15 -X POST "$API/sendMessage" \
+    --data-urlencode "chat_id=${TG_CHAT_ID}" \
+    --data-urlencode "text=$1" 2>/dev/null)
+  [ "$(jq -r '.ok // false' <<<"$resp" 2>/dev/null)" = "true" ] || spool - "$1" "$resp"
+  return 0
+}
+# send and return the message_id; 3 attempts. Failure → log + return 1 (do NOT
+# park for the full window without an anchor: there would be nothing to reply
+# to; delivering the text is then the caller's job via spool).
 send_id() {
   [ -n "${TG_TOKEN:-}" ] || return 1
   local try resp mid
@@ -104,6 +125,9 @@ send_id() {
     [ -n "$mid" ] && { echo "$mid"; return 0; }
     sleep 2
   done
+  printf '%s send_id FAIL after 3 attempts (len=%s): %.200s\n' "$(date '+%F %T')" "${#1}" \
+    "$(jq -rc '{error_code,description}' <<<"$resp" 2>/dev/null || printf '%s' "$resp")" \
+    >> "$DIR/daemon.log"
   return 1
 }
 
@@ -253,16 +277,20 @@ case "$event" in
     sid8="${sid:0:8}"
     park_secs="$PARK_SECS"
     if [ -n "$rep" ] && [ "$newh" != "$prevh" ]; then
-      # Write lastmirror ONLY after a successful send — otherwise a one-off
-      # network failure would "eat" the reply forever (hash committed, no retry).
-      if mid=$(send_id "💬 $name [#s$sid8]:
+      mtext="💬 $name [#s$sid8]:
 
 $rep
 
-↩️ To continue the conversation — reply to this message."); then
+↩️ To continue the conversation — reply to this message."
+      # Write lastmirror after a successful send OR after a spool: in both cases
+      # delivery is guaranteed (the daemon resends the spool), and re-mirroring
+      # the same text would produce a duplicate.
+      if mid=$(send_id "$mtext"); then
         printf '%s' "$newh" > "$LASTMIRROR/$sid"
       else
         mid=""
+        spool "$sid" "$mtext"
+        printf '%s' "$newh" > "$LASTMIRROR/$sid"
       fi
     else
       # The final text didn't materialize within MIRROR_WAIT or was already
@@ -270,8 +298,9 @@ $rep
       # misleading). DELIBERATELY the same for a final still being written
       # (cksum grows tick-to-tick): better "see the IDE" than a chunk cut
       # mid-word.
-      mid=$(send_id "💬 $name [#s$sid8] finished its turn and is waiting for you (details — in the IDE).
-↩️ To continue — reply to this message.") || mid=""
+      ntext="💬 $name [#s$sid8] finished its turn and is waiting for you (details — in the IDE).
+↩️ To continue — reply to this message."
+      mid=$(send_id "$ntext") || { mid=""; spool "$sid" "$ntext"; }
     fi
     # Reply binding by message_id; [#s...] in the text is a fallback for repeat
     # replies to the same anchor. Without an anchor (TG unreachable) — a short

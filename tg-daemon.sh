@@ -41,7 +41,8 @@ MSGMAP="$DIR/msgmap"      # message_id → target (s:<sid> / q:<qid>); written b
 OFFSET_FILE="$DIR/offset"
 PIDFILE="$DIR/daemon.pid"
 BEAT="$DIR/daemon.beat"   # daemon liveness heartbeat
-mkdir -p "$PENDING" "$ANSWERS" "$SESSIONS" "$INBOX" "$PARKED" "$MSGMAP"
+OUTBOX="$DIR/outbox"      # undelivered hook messages (sendMessage failure) — resend from here
+mkdir -p "$PENDING" "$ANSWERS" "$SESSIONS" "$INBOX" "$PARKED" "$MSGMAP" "$OUTBOX"
 
 # Telegram sendMessage rejects text >4096 (HTTP 400). This (and any other) failure
 # used to be swallowed by `>/dev/null || true` → /sessions "didn't work" silently.
@@ -344,6 +345,55 @@ To message a session — REPLY to one of its messages, or add a #s<first 8 chars
   say "↩️ REPLY to the specific message you mean (or add a #s<id> tag to your text) — otherwise I don't know who this is for. /sessions — the list."
 }
 
+# ── Outbox: resend what the hooks failed to send (network/429/TG outage) ─────
+# Files outbox/<epoch>.<sid|->.<pid> (written by spool in tg-session.sh) are sent
+# in order (oldest first, lexicographic sort by epoch) with the original
+# timestamp; for sid≠- with a LIVE session record we also write a msgmap anchor —
+# a reply to the delayed mirror routes as usual. The first transient failure →
+# stop until the next iteration (TG is still down; order is preserved).
+# Exception: HTTP 400 (the message won't become deliverable by itself — in
+# practice only "too long") → chunked via say and the file is removed, so a
+# "poison" message never blocks the queue forever.
+flush_outbox() {
+  local fn ts sid text hhmm resp ok mid ec
+  for fn in $(ls "$OUTBOX" 2>/dev/null | sort | head -20); do
+    [ -f "$OUTBOX/$fn" ] || continue
+    touch "$BEAT"   # a long flush (serial 15s curls) must not "kill" the heartbeat for parks
+    ts=${fn%%.*}; sid=${fn#*.}; sid=${sid%.*.*}   # <epoch>.<sid|->.<pid>.<rand>
+    text=$(cat "$OUTBOX/$fn" 2>/dev/null) || continue
+    hhmm=$(date -r "$ts" '+%H:%M' 2>/dev/null || echo "??:??")
+    resp=$(curl -s --max-time 15 -X POST "$API/sendMessage" \
+      --data-urlencode "chat_id=${TG_CHAT_ID}" \
+      --data-urlencode "text=📬 delayed (from $hhmm — Telegram was unreachable):
+
+$text" 2>/dev/null)
+    ok=$(jq -r '.ok // false' <<<"$resp" 2>/dev/null)
+    if [ "$ok" = "true" ]; then
+      mid=$(jq -r '.result.message_id // empty' <<<"$resp" 2>/dev/null)
+      [ -n "$mid" ] && [ "$sid" != "-" ] && [ -f "$SESSIONS/$sid" ] && echo "s:$sid" > "$MSGMAP/$mid"
+      rm -f "$OUTBOX/$fn"
+      printf '%s outbox: resent %s\n' "$(date '+%F %T')" "$fn" >> "$DIR/daemon.log"
+    else
+      ec=$(jq -r '.error_code // empty' <<<"$resp" 2>/dev/null)
+      if [ "$ec" = "400" ]; then
+        say "📬 delayed (from $hhmm):
+$text"
+        rm -f "$OUTBOX/$fn"
+        printf '%s outbox: %s rejected as a whole (400) — resent chunked, no anchor\n' \
+          "$(date '+%F %T')" "$fn" >> "$DIR/daemon.log"
+      else
+        # Transient (network/429/5xx) or sticky (403 — bot blocked): stop until
+        # the next iteration, the file stays. Errors WITH a code get logged — a
+        # silent eternal break is undiagnosable; network blips (empty resp) are
+        # not spammed.
+        [ -n "$ec" ] && printf '%s outbox: %s not resent (ec=%s) — retrying next iteration\n' \
+          "$(date '+%F %T')" "$fn" "$ec" >> "$DIR/daemon.log"
+        break
+      fi
+    fi
+  done
+}
+
 # ── For unit tests: define the functions and skip the runtime. ──
 [ "${TG_DAEMON_TEST:-0}" = "1" ] && return 0 2>/dev/null
 
@@ -406,6 +456,7 @@ while true; do
     fi
     LAST_SWEEP=$now
   fi
+  flush_outbox
   OFFSET=$(cat "$OFFSET_FILE" 2>/dev/null || echo "")
   RESP=$(curl -s --max-time 60 \
     "$API/getUpdates?timeout=50${OFFSET:+&offset=$OFFSET}" 2>/dev/null || echo "")
