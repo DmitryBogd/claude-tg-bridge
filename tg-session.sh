@@ -154,6 +154,14 @@ name=$(basename "$cwd" 2>/dev/null || echo "")
 f="$SESSIONS/$sid"
 inbox="$INBOX/$sid"
 
+# Structural filter: do NOT register sessions whose cwd is the home dir ($HOME).
+# Real working sessions always run inside a project dir; cwd=$HOME means headless/
+# eval sessions (Desktop cowork, `claude -p`, benchmarks) that start in bursts,
+# never fire SessionEnd, and flood /sessions with hundreds of dead records faster
+# than any reaper. Filtering at registration is the root cause, not the symptom.
+# exit 0 on ANY event: an unregistered session needs no cleanup either.
+[ -n "$HOME" ] && [ "$cwd" = "$HOME" ] && exit 0
+
 case "$event" in
   start)
     # startup/clear — definitely no active turn → idle. resume/compact can fire

@@ -43,18 +43,79 @@ PIDFILE="$DIR/daemon.pid"
 BEAT="$DIR/daemon.beat"   # daemon liveness heartbeat
 mkdir -p "$PENDING" "$ANSWERS" "$SESSIONS" "$INBOX" "$PARKED" "$MSGMAP"
 
-say() {
-  curl -s --max-time 15 -X POST "$API/sendMessage" \
+# Telegram sendMessage rejects text >4096 (HTTP 400). This (and any other) failure
+# used to be swallowed by `>/dev/null || true` → /sessions "didn't work" silently.
+# Now: split into chunks ≤TG_BYTES on line boundaries, LOG failures (so the next
+# failure is diagnosable, not mute), and retry a failed HTML chunk (broken tag) as
+# plain — visibly degraded beats silence.
+# LIMIT IN BYTES, not code points: Telegram counts 4096 UTF-16 units, and UTF-8
+# byte length is always ≥ UTF-16-unit length (ASCII 1B/1u, Cyrillic 2B/1u, astral
+# emoji 4B/2u). So "bytes ≤ 4096" ⟹ "UTF-16 ≤ 4096" for any Unicode — no pile-up
+# of emoji can breach the limit (a code-point cap fails to catch that).
+TG_BYTES=4000          # headroom under 4096
+MAX_CHUNKS=20          # cap of chunks per call (~80KB) — anti-flood/anti-ban
+blen() { local LC_ALL=C; printf %s "${#1}"; }   # string length in BYTES (C locale)
+
+# Send ONE chunk. Returns 0 only when Telegram answered ok=true.
+_tg_send_chunk() {  # $1=text  $2=parse_mode (empty = plain)
+  local resp ok
+  resp=$(curl -s --max-time 15 -X POST "$API/sendMessage" \
     --data-urlencode "chat_id=${TG_CHAT_ID}" \
-    --data-urlencode "text=$1" >/dev/null 2>&1 || true
+    ${2:+--data-urlencode "parse_mode=$2"} \
+    --data-urlencode "text=$1" 2>/dev/null)
+  ok=$(jq -r '.ok // false' <<<"$resp" 2>/dev/null)
+  [ "$ok" = "true" ] && return 0
+  printf '%s sendMessage FAIL (mode=%s len=%s): %s\n' "$(date '+%F %T')" \
+    "${2:-plain}" "${#1}" "$(jq -rc '{error_code,description}' <<<"$resp" 2>/dev/null || printf '%.200s' "$resp")" \
+    >> "$DIR/daemon.log"
+  return 1
 }
+
+# Split text into chunks ≤TG_BYTES on line boundaries and send sequentially. Line
+# boundaries are safe for our HTML: every list line is self-balanced (<b>…</b>,
+# <code>…</code> wholly within one line), so each chunk stays valid. A single line
+# longer than the limit (never in /sessions, but say/say_html are now the general
+# path) is sliced char-wise by 900 code points (≤3600 bytes even for solid 4-byte
+# emoji). If any chunk never went out (even as plain) — emit a visible marker so a
+# partial delivery is not silent-by-omission. Flood guard: never send more than
+# MAX_CHUNKS messages per call (no legit daemon message is that big; /sessions is
+# bounded by the reaper); the elision is announced + logged, not mute.
+_tg_send() {  # $1=text  $2=parse_mode
+  local text="$1" mode="$2" chunk="" line failed=0 sent=0 capped=0
+  emit() {
+    sent=$((sent + 1))
+    [ "$sent" -gt "$MAX_CHUNKS" ] && { capped=1; return; }
+    _tg_send_chunk "$1" "$mode" || { [ -n "$mode" ] && _tg_send_chunk "$1" ""; } || failed=1
+  }
+  if [ "$(blen "$text")" -le "$TG_BYTES" ]; then emit "$text"
+  else
+    while IFS= read -r line || [ -n "$line" ]; do
+      if [ "$(blen "$line")" -gt "$TG_BYTES" ]; then
+        [ -n "$chunk" ] && { emit "$chunk"; chunk=""; }
+        while [ "$(blen "$line")" -gt "$TG_BYTES" ]; do emit "${line:0:900}"; line="${line:900}"; done
+        chunk="$line"; continue
+      fi
+      if [ -n "$chunk" ] && [ "$(blen "$chunk
+$line")" -gt "$TG_BYTES" ]; then
+        emit "$chunk"; chunk="$line"
+      else
+        chunk="${chunk:+$chunk
+}$line"
+      fi
+    done <<<"$text"
+    [ -n "$chunk" ] && emit "$chunk"
+  fi
+  if [ "$capped" = 1 ]; then
+    _tg_send_chunk "✂️ message too large — showing first $MAX_CHUNKS parts ($sent total)" ""
+    printf '%s flood cap: %s/%s parts sent (mode=%s)\n' "$(date '+%F %T')" "$MAX_CHUNKS" "$sent" "${mode:-plain}" >> "$DIR/daemon.log"
+  fi
+  [ "$failed" = 1 ] && _tg_send_chunk "⚠️ part of the message could not be sent — see daemon.log" ""
+  return 0
+}
+
+say()      { _tg_send "$1" ""; }
 # <code>…</code> in Telegram is copied on tap. Escape dynamic parts via esc().
-say_html() {
-  curl -s --max-time 15 -X POST "$API/sendMessage" \
-    --data-urlencode "chat_id=${TG_CHAT_ID}" \
-    --data-urlencode "parse_mode=HTML" \
-    --data-urlencode "text=$1" >/dev/null 2>&1 || true
-}
+say_html() { _tg_send "$1" "HTML"; }
 esc() { printf '%s' "$1" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g'; }
 
 fmtime() { stat -f %m "$1" 2>/dev/null || echo 0; }
@@ -80,19 +141,33 @@ live_parks() {
   echo "$n $hit"
 }
 
-# Remove stale sessions (>12 h without activity) TOGETHER with their leftovers;
-# a queue nobody will ever take is honestly bounced back to TG.
+# Remove dead sessions TOGETHER with their leftovers; a queue nobody will ever
+# take is honestly bounced back to TG. Two activity thresholds (max of last and
+# transcript mtime):
+#   • any record >12 h — stale;
+#   • state=running with no live park >6 h — dead "running" (crash/SIGKILL, or a
+#     headless `claude -p` that exited without SessionEnd). 6 h is headroom over
+#     the longest real turn, so a live long-running session is never touched.
+RUNNING_REAP=21600   # 6 h
 prune_sessions() {
-  local now f sid last pend
+  local now f sid last state tp act pend tm
   now=$(date +%s)
   shopt -s nullglob
   for f in "$SESSIONS"/*; do
     [ -f "$f" ] || continue
-    last=$(field "$f" last)
-    [ -n "$last" ] && [ $(( now - last )) -gt 43200 ] || continue
     sid=$(basename "$f")
+    park_alive "$sid" && continue          # live park — never touch
+    last=$(field "$f" last); [ -n "$last" ] || last=0
+    state=$(field "$f" state)
+    tp=$(field "$f" tpath)
+    act=$last
+    [ -n "$tp" ] && [ -f "$tp" ] && { tm=$(fmtime "$tp"); [ "$tm" -gt "$act" ] && act=$tm; }
+    if [ $(( now - act )) -gt 43200 ]; then :
+    elif [ "$state" = "running" ] && [ $(( now - act )) -gt "$RUNNING_REAP" ]; then :
+    else continue
+    fi
     pend=$( { cat "$INBOX/$sid.taken" 2>/dev/null; cat "$INBOX/$sid" 2>/dev/null; } )
-    [ -n "$pend" ] && say "⚠️ [$(field "$f" name)] session went stale and was removed — NOT delivered: ${pend:0:500}"
+    [ -n "$pend" ] && say "⚠️ [$(field "$f" name)] session is inactive and was removed — NOT delivered: ${pend:0:500}"
     rm -f "$f" "$INBOX/$sid" "$INBOX/$sid.taken" "$DIR/lastmirror/$sid" "$PARKED/$sid"
   done
   shopt -u nullglob
@@ -295,6 +370,14 @@ while true; do
   if [ $(( now - LAST_SWEEP )) -gt 3600 ]; then
     find "$MSGMAP" -type f -mmin +2880 -delete 2>/dev/null || true
     find "$PARKED" -type f -mmin +3 -delete 2>/dev/null || true
+    # daemon.log is both launchd stdout/stderr and the sendMessage-failure log;
+    # cap at ~1MB → keep the last 500 lines. COPYTRUNCATE (cat > file, not mv):
+    # preserves the inode, so the launchd fd (O_APPEND) stays valid and never
+    # writes into a deleted inode.
+    if [ -f "$DIR/daemon.log" ] && [ "$(wc -c < "$DIR/daemon.log" 2>/dev/null || echo 0)" -gt 1048576 ]; then
+      tail -n 500 "$DIR/daemon.log" > "$DIR/daemon.log.rot" 2>/dev/null \
+        && cat "$DIR/daemon.log.rot" > "$DIR/daemon.log" && rm -f "$DIR/daemon.log.rot"
+    fi
     LAST_SWEEP=$now
   fi
   OFFSET=$(cat "$OFFSET_FILE" 2>/dev/null || echo "")
