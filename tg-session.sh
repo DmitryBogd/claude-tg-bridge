@@ -1,41 +1,41 @@
 #!/bin/bash
-# tg-session.sh — реєстр активних Claude-сесій + доставка повідомлень + tg-режим «park».
-# Викликається з хуків:
-#   SessionStart      → start  (зареєструвати; source=startup/clear скидає стан в idle)
-#   UserPromptSubmit  → beat   (оновити активність; state=running)
-#   Stop              → stop   (state=idle; інжекція з черги; у tg-режимі — дзеркало
-#                               ФІНАЛЬНОЇ відповіді в TG + парк з heartbeat)
-#   SessionEnd        → end    (прибрати запис; недоставлене з inbox — bounce у TG)
-# Аргумент $1 = подія. stdin = JSON хука (session_id, cwd, transcript_path, ...).
-# Реєстр: sessions/<sid> — key=value (name/cwd/started/last/state/stopped/tpath),
-# запис атомарний (tmp+mv). Черга: inbox/<sid>. Парк: parked/<sid> — «живість»
-# визначається за mtime (парк-цикл touch-ає файл щоітерації), НЕ за kill -0 pid
-# (pid-reuse дає хибно-живі парки після SIGKILL).
-# Тест: TG_SESSION_TEST=1 source tg-session.sh — визначає функції без запуску.
+# tg-session.sh — registry of active Claude sessions + message delivery + tg-mode "park".
+# Called from hooks:
+#   SessionStart      → start  (register; source=startup/clear resets state to idle)
+#   UserPromptSubmit  → beat   (refresh activity; state=running)
+#   Stop              → stop   (state=idle; inject queued messages; in tg-mode —
+#                               mirror the FINAL reply to TG + park with heartbeat)
+#   SessionEnd        → end    (remove the record; undelivered inbox — bounce to TG)
+# Argument $1 = event. stdin = hook JSON (session_id, cwd, transcript_path, ...).
+# Registry: sessions/<sid> — key=value (name/cwd/started/last/state/stopped/tpath),
+# written atomically (tmp+mv). Queue: inbox/<sid>. Park: parked/<sid> — liveness
+# is judged by mtime (the park loop touches the file every iteration), NOT by
+# kill -0 on a pid (pid reuse yields false-alive parks after SIGKILL).
+# Testing: TG_SESSION_TEST=1 source tg-session.sh — defines functions without running.
 set -uo pipefail
-export LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8   # launchd C-локаль ламає токенізацію $var«кирилиця»
+export LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8   # launchd's C locale breaks tokenization of non-ASCII text
 
 DIR="${TG_HITL_DIR:-$HOME/.claude/tg-hitl}"
 SESSIONS="$DIR/sessions"
 INBOX="$DIR/inbox"
 PARKED="$DIR/parked"
 MSGMAP="$DIR/msgmap"
-LASTMIRROR="$DIR/lastmirror"   # хеш останньої здзеркаленої відповіді на сесію (дедуп)
+LASTMIRROR="$DIR/lastmirror"   # hash of the last mirrored reply per session (dedup)
 mkdir -p "$SESSIONS" "$INBOX" "$PARKED" "$MSGMAP" "$LASTMIRROR"
 [ -f "$DIR/.env" ] && . "$DIR/.env"
 API="${TG_API_BASE:-https://api.telegram.org}/bot${TG_TOKEN:-}"
 
-# Скільки максимум парк чекає твоє повідомлення (с). Вікно + дзеркало мусять
-# влізти в timeout Stop-хука (1800 у settings.json) — див. HOOK_BUDGET.
+# Max time the park waits for your message (s). The window + the mirror must
+# fit into the Stop hook's timeout (1800 in settings.json) — see HOOK_BUDGET.
 PARK_SECS="${TG_PARK_SECS:-1500}"
-MIRROR_WAIT="${TG_MIRROR_WAIT:-25}"   # стеля очікування фінального тексту в транскрипті, с
-HOOK_BUDGET=1740                      # жорсткий ліміт життя stop-хука (запас 60с до 1800)
+MIRROR_WAIT="${TG_MIRROR_WAIT:-25}"   # ceiling for waiting for the final text in the transcript, s
+HOOK_BUDGET=1740                      # hard lifetime limit of the stop hook (60 s margin below 1800)
 
-# ── Запис реєстру ─────────────────────────────────────────────────────────────
+# ── Registry record ───────────────────────────────────────────────────────────
 read_field() { sed -n "s/^$1=//p" "$f" 2>/dev/null | head -1; }
 
-# save_session <state> [stopped] — атомарно переписати запис, зберігши started і
-# поля, яких немає в цьому виклику хука (tpath на start/end може бути порожнім).
+# save_session <state> [stopped] — atomically rewrite the record, preserving
+# started and any fields absent in this hook call (tpath may be empty on start/end).
 save_session() {
   local nowts started stopped tp nm cw
   nowts=$(date +%s)
@@ -50,14 +50,14 @@ save_session() {
 }
 
 # ── Telegram ──────────────────────────────────────────────────────────────────
-tg() {  # надіслати простий текст у TG (best-effort)
+tg() {  # send plain text to TG (best-effort)
   [ -n "${TG_TOKEN:-}" ] || return 0
   curl -s --max-time 15 -X POST "$API/sendMessage" \
     --data-urlencode "chat_id=${TG_CHAT_ID}" \
     --data-urlencode "text=$1" >/dev/null 2>&1 || true
 }
-# надіслати і повернути message_id; 3 спроби. Невдача → return 1 (НЕ паркуємось
-# на повний строк без якоря: реплаїти не буде на що).
+# send and return the message_id; 3 attempts. Failure → return 1 (do NOT park
+# for the full window without an anchor: there would be nothing to reply to).
 send_id() {
   [ -n "${TG_TOKEN:-}" ] || return 1
   local try resp mid
@@ -72,19 +72,19 @@ send_id() {
   return 1
 }
 
-# tg-режим активний для цього cwd? (глобальний away АБО per-project прапорець)
+# Is tg-mode active for this cwd? (per-project flag; the global "away" mode was
+# removed — OR logic of two switches made disabling confusing)
 tg_mode_on() {
-  [ -f "$DIR/away" ] && return 0
   [ -n "$cwd" ] && [ -f "$DIR/projects/$(printf '%s' "$cwd" | sed 's#/#%#g')" ]
 }
 
-# ── Кандидат на дзеркало ──────────────────────────────────────────────────────
-# Бере ОСТАННІЙ assistant-текст і визначає, чи він ФІНАЛЬНИЙ: після нього (і в
-# ньому самому) немає tool_use. Проміжні статуси завжди мають tool-активність
-# після себе — це відсікає клас «віддзеркалили статус замість відповіді».
-# Зріз — 3000 КОДПОЇНТІВ у jq (байтовий head -c різав UTF-8 посеред символу →
-# Telegram 400 → дзеркало мовчки губилось). Обірваний останній рядок jsonl валить
-# jq -s цілком → порожній кандидат → ретрай наступного тіку (самозцілення).
+# ── Mirror candidate ──────────────────────────────────────────────────────────
+# Takes the LAST assistant text and decides whether it is FINAL: no tool_use
+# after it (or inside it). Intermediate status texts always have tool activity
+# after them — this cuts off the "mirrored a status instead of the reply" class.
+# Slice — 3000 CODEPOINTS in jq (a byte-wise head -c cut UTF-8 mid-character →
+# Telegram 400 → the mirror was silently lost). A truncated last jsonl line fails
+# jq -s entirely → empty candidate → retry on the next tick (self-healing).
 read_candidate() {
   CAND_TEXT=""; CAND_FINAL=0
   [ -n "$tpath" ] && [ -f "$tpath" ] || return 0
@@ -98,7 +98,7 @@ read_candidate() {
     | if $li == null then {final: false, text: ""}
       else {final: ((.[$li].u | not) and ((.[($li+1):] | map(select(.u)) | length) == 0)),
             text: (.[$li].x
-                   | if length > 3000 then .[0:3000] + "…\n[обрізано — повний текст в IDE]"
+                   | if length > 3000 then .[0:3000] + "…\n[truncated — full text in the IDE]"
                      else . end)}
       end' 2>/dev/null)
   [ -n "$obj" ] || return 0
@@ -107,17 +107,18 @@ read_candidate() {
   return 0
 }
 
-# Інжектувати повідомлення в сесію (продовжити хід із цим текстом).
+# Inject a message into the session (continue the turn with this text).
 inject() {
   save_session running
-  tg "✅ [$name] прийнято, продовжую."   # ЛИШЕ при реальній доставці; з назвою проєкту
-  jq -n --arg r "[Дмитро через Telegram]
+  tg "✅ [$name] received, continuing."   # ONLY on actual delivery; with the project name
+  jq -n --arg r "[User via Telegram]
 $1" '{decision: "block", reason: $r}'
 }
 
-# Демон живий? Основний критерій — heartbeat-файл (демон touch-ає його щоітерації;
-# свіжість ≤120с, бо long-poll тримає ітерацію до ~60с). kill -0 по pid — лише
-# fallback на перехідний період (pid-reuse робить його ненадійним).
+# Is the daemon alive? Primary criterion — the heartbeat file (the daemon touches
+# it every iteration; freshness ≤120 s, since long-poll holds an iteration up to
+# ~60 s). kill -0 on the pid is only a transition-period fallback (pid reuse
+# makes it unreliable).
 daemon_alive() {
   local b="$DIR/daemon.beat" p
   if [ -f "$b" ]; then
@@ -128,8 +129,8 @@ daemon_alive() {
   [ -n "$p" ] && kill -0 "$p" 2>/dev/null
 }
 
-# Атомарно забрати вміст inbox: mv (атомарний) → читаємо копію. Якщо демон
-# дописав (append) між нашим читанням і видаленням — це піде в НОВИЙ inbox, не згубиться.
+# Atomically take the inbox contents: mv (atomic) → read the copy. If the daemon
+# appends between our read and delete — it goes to a NEW inbox, nothing is lost.
 take_inbox() {
   [ -s "$inbox" ] || return 1
   mv "$inbox" "$inbox.taken" 2>/dev/null || return 1
@@ -138,7 +139,7 @@ take_inbox() {
 
 park_is_ours() { [ "$(cat "$PARKED/$sid" 2>/dev/null)" = "$$" ]; }
 
-# ── Для юніт-тестів: визначити функції й не запускати рантайм. ──
+# ── For unit tests: define the functions and skip the runtime. ──
 [ "${TG_SESSION_TEST:-0}" = "1" ] && return 0 2>/dev/null
 
 ENTRY_TS=$(date +%s)
@@ -155,8 +156,8 @@ inbox="$INBOX/$sid"
 
 case "$event" in
   start)
-    # startup/clear — точно немає активного ходу → idle. resume/compact можуть
-    # стріляти ПОСЕРЕД живого ходу → зберегти попередній стан, щоб не брехати.
+    # startup/clear — definitely no active turn → idle. resume/compact can fire
+    # MID-turn → keep the previous state so we don't lie.
     case "$src" in
       startup|clear) save_session idle ;;
       *) st=$(read_field state); save_session "${st:-idle}" ;;
@@ -164,33 +165,34 @@ case "$event" in
     ;;
   beat) save_session running ;;
   end)
-    # Черга, яку вже ніхто не забере, — чесно повернути в TG, а не мовчки стерти.
+    # A queue nobody will ever take — honestly bounce it to TG, don't silently drop.
     pend=$( { cat "$inbox.taken" 2>/dev/null; cat "$inbox" 2>/dev/null; } )
-    [ -n "$pend" ] && tg "⚠️ [$name] сесія закрилась — НЕ доставлено: ${pend:0:500}"
+    [ -n "$pend" ] && tg "⚠️ [$name] session closed — NOT delivered: ${pend:0:500}"
     rm -f "$f" "$inbox" "$inbox.taken" "$inbox".merge.* "$PARKED/$sid" "$LASTMIRROR/$sid"
     ;;
   stop)
-    save_session idle "$ENTRY_TS"   # хід завершено в момент входу в хук
-    # 0) Повернути осиротілий .taken (хук минулого разу вбили між mv і cat).
-    # «:» в кінці групи обов'язковий: без нього rc групи = rc останнього cat
-    # (inbox зазвичай відсутній) і mv по && ніколи б не виконався.
+    save_session idle "$ENTRY_TS"   # the turn ended the moment we entered the hook
+    # 0) Recover an orphaned .taken (the hook was killed between mv and cat last time).
+    # The trailing ":" in the group is mandatory: without it the group's rc = rc of
+    # the last cat (inbox is usually absent) and the mv after && would never run.
     if [ -f "$inbox.taken" ]; then
       { cat "$inbox.taken" 2>/dev/null; cat "$inbox" 2>/dev/null; :; } > "$inbox.merge.$$" \
         && mv "$inbox.merge.$$" "$inbox" && rm -f "$inbox.taken"
     fi
-    # 1) Уже є повідомлення в черзі (надіслане, поки сесія працювала) — доставити.
+    # 1) A message is already queued (sent while the session was working) — deliver.
     if msg=$(take_inbox); then
       inject "$msg"
       exit 0
     fi
-    # 2) Поза tg-режимом — звичайна зупинка.
+    # 2) Outside tg-mode — a normal stop.
     tg_mode_on || exit 0
-    # 3) tg-режим: дочекатись ФІНАЛЬНОЇ відповіді в транскрипті й здзеркалити.
-    # Фінальний текст флашиться в jsonl у момент Stop або на кілька секунд пізніше
-    # (інцидент 2026-06-11: дзеркало пішло на 0.3с раніше за флаш і взяло проміжний
-    # статус). Критерій прийняття: кандидат ФІНАЛЬНИЙ (без tool_use після нього)
-    # і стабільний два тіки поспіль. Хеш lastmirror — ЛИШЕ для дедуплікації
-    # «нічого нового» (хід без тексту), не для вибору кандидата.
+    # 3) tg-mode: wait for the FINAL reply in the transcript and mirror it.
+    # The final text flushes to the jsonl at the moment of Stop or a few seconds
+    # later (incident: the mirror ran 0.3 s before the flush and picked up an
+    # intermediate status). Acceptance criterion: the candidate is FINAL (no
+    # tool_use after it) and stable two ticks in a row. The lastmirror hash is
+    # ONLY for deduplicating "nothing new" (a turn without text), not for
+    # choosing the candidate.
     prevh=$(cat "$LASTMIRROR/$sid" 2>/dev/null || echo "")
     rep=""; newh=""; stable=""
     i=0
@@ -208,59 +210,61 @@ case "$event" in
     sid8="${sid:0:8}"
     park_secs="$PARK_SECS"
     if [ -n "$rep" ] && [ "$newh" != "$prevh" ]; then
-      # lastmirror пишемо ЛИШЕ після успішної відправки — інакше разовий збій
-      # мережі назавжди «з'їдав» відповідь (хеш закомічено, повтору не буде).
+      # Write lastmirror ONLY after a successful send — otherwise a one-off
+      # network failure would "eat" the reply forever (hash committed, no retry).
       if mid=$(send_id "💬 $name [#s$sid8]:
 
 $rep
 
-↩️ Щоб продовжити розмову — відповідай реплаєм на це повідомлення."); then
+↩️ To continue the conversation — reply to this message."); then
         printf '%s' "$newh" > "$LASTMIRROR/$sid"
       else
         mid=""
       fi
     else
-      # Фінал не зчитався за MIRROR_WAIT або він уже дзеркалився → чесне
-      # нейтральне запрошення БЕЗ stale-тексту (старий текст вводив в оману).
-      # СВІДОМО так і для фіналу, що ще дописується (cksum росте тік-до-тіку):
-      # краще «дивись в IDE», ніж обрізаний на півслові шматок.
-      mid=$(send_id "💬 $name [#s$sid8] завершив хід і чекає на тебе (деталі — в IDE).
-↩️ Щоб продовжити — відповідай реплаєм на це повідомлення.") || mid=""
+      # The final text didn't materialize within MIRROR_WAIT or was already
+      # mirrored → an honest neutral invitation WITHOUT stale text (old text was
+      # misleading). DELIBERATELY the same for a final still being written
+      # (cksum grows tick-to-tick): better "see the IDE" than a chunk cut
+      # mid-word.
+      mid=$(send_id "💬 $name [#s$sid8] finished its turn and is waiting for you (details — in the IDE).
+↩️ To continue — reply to this message.") || mid=""
     fi
-    # Прив'язка реплая за message_id; [#s...] у тексті — fallback для повторних
-    # реплаїв на той самий якір. Без якоря (TG недоступний) — короткий парк:
-    # достукатись однаково можна лише тегом #s у власному тексті.
+    # Reply binding by message_id; [#s...] in the text is a fallback for repeat
+    # replies to the same anchor. Without an anchor (TG unreachable) — a short
+    # park: the only way to reach the session anyway is the #s tag in your own text.
     [ -n "$mid" ] && echo "s:$sid" > "$MSGMAP/$mid"
     [ -n "$mid" ] || park_secs=$(( PARK_SECS / 5 ))
     trap 'park_is_ours && rm -f "$PARKED/$sid"' EXIT
     echo $$ > "$PARKED/$sid"
-    # Дедлайн: і парк, і фінальні спроби мусять закінчитись до стелі хука,
-    # інакше SIGKILL без trap → спожите повідомлення втрачено.
+    # Deadline: both the park and the final attempts must finish before the
+    # hook's ceiling, otherwise SIGKILL without trap → a consumed message is lost.
     deadline=$(( $(date +%s) + park_secs ))
     hard=$(( ENTRY_TS + HOOK_BUDGET - 60 ))
     [ "$deadline" -gt "$hard" ] && deadline="$hard"
     dead_since=0
     while [ "$(date +%s)" -lt "$deadline" ]; do
-      touch "$PARKED/$sid" 2>/dev/null   # heartbeat: «живий парк» = свіжий mtime
+      touch "$PARKED/$sid" 2>/dev/null   # heartbeat: "live park" = fresh mtime
       if msg=$(take_inbox); then
         park_is_ours && rm -f "$PARKED/$sid"
         inject "$msg"
         exit 0
       fi
-      # Демон лежить довше ~60с → не висіти мовчки (KeepAlive зазвичай підіймає
-      # за ~10с; якщо мертвий назовсім — краще віддати керування).
+      # Daemon down longer than ~60 s → don't hang silently (KeepAlive usually
+      # brings it back in ~10 s; if it's dead for good — better to yield control).
       if daemon_alive; then dead_since=0
       else
         [ "$dead_since" = 0 ] && dead_since=$(date +%s)
         if [ $(( $(date +%s) - dead_since )) -gt 60 ]; then
-          tg "⚠️ [$name] демон Telegram недоступний — парк завершую; твоє повідомлення дійде на наступному кроці сесії."
+          tg "⚠️ [$name] the Telegram daemon is unreachable — ending the park; your message will arrive on the session's next turn."
           break
         fi
       fi
       sleep 3
     done
-    # Вихід з парку: СПОЧАТКУ зняти маркер (демон далі чесно скаже «у черзі»),
-    # ПОТІМ остання спроба inbox — закриває вікно «прилетіло в останні 3с».
+    # Leaving the park: FIRST remove the marker (so the daemon honestly says
+    # "queued"), THEN one last inbox attempt — closes the "arrived in the last
+    # 3 s" window.
     park_is_ours && rm -f "$PARKED/$sid"
     if msg=$(take_inbox); then
       inject "$msg"

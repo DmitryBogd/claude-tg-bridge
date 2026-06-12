@@ -13,8 +13,8 @@ away from the computer.
   mode for fire-and-forget notifications.
 
 - **Permission confirmations** — `PermissionRequest` hook routes approval prompts
-  to Telegram in "away" or per-project tg-mode. Reply "так/yes/+" to allow,
-  "ні/no/-" to deny. Silence for 4 min → falls back to the normal local dialog.
+  to Telegram when per-project tg-mode is on. Reply "yes"/"+" to allow,
+  "no"/"-" to deny. Silence for 4 min → falls back to the normal local dialog.
 
 - **Session park** — when tg-mode is active, after each Claude turn the `Stop` hook
   mirrors the assistant's **final** reply to Telegram (it waits for the transcript
@@ -51,19 +51,59 @@ answer routing is via Telegram reply-to (message_id → msgmap/ lookup).
 
 ## Requirements
 
-- macOS (uses launchd for auto-start; the scripts themselves run on any Linux/macOS with bash 4+, but the installer and daemon auto-restart are macOS-only)
-- `bash`, `curl`, `jq`
+- macOS (see [Platform support](#platform-support) for Linux/Windows)
+- `bash` (3.2+ — the stock macOS bash works), `curl`, `jq`
 - A Telegram bot token (`@BotFather`) + your personal chat ID
+
+## Platform support
+
+| Platform | Status |
+|---|---|
+| **macOS** | ✅ Fully supported: installer, launchd auto-start/auto-restart. |
+| **Linux** | ⚠️ The scripts are plain bash + curl + jq, but two macOS-isms must be patched: `stat -f %m` (BSD) → `stat -c %Y`, and the `launchctl kickstart` daemon-revival calls. Run `tg-daemon.sh` under a systemd user service instead of launchd. Untested — patches welcome. |
+| **Windows (WSL2)** | ⚠️ The realistic path: run Claude Code *inside* WSL, apply the Linux notes above (WSL2 supports systemd user services). The hooks fire inside WSL, so the whole chain stays POSIX. Untested — reports welcome. |
+| **Windows (native)** | ❌ Not supported. These are bash scripts wired into Claude Code hooks assuming a POSIX shell, a BSD/GNU userland, and a service manager for the always-on daemon — none of which exist natively. Use WSL2. |
 
 ## Setup
 
-### 1. Create a bot
+### Option A — let an AI agent set it up
+
+Paste this into Claude Code (or any AI assistant with shell access) and answer
+its questions:
+
+```text
+Set up claude-tg-bridge — a Telegram human-in-the-loop bridge for Claude Code
+(https://github.com/DmitryBogd/claude-tg-bridge). Steps:
+
+1. Verify prerequisites: macOS, bash, curl, jq (offer `brew install jq` if missing).
+2. Clone https://github.com/DmitryBogd/claude-tg-bridge.git and run ./install.sh.
+3. Walk me through creating a Telegram bot: I message @BotFather → /newbot →
+   I get a token. Then help me find my numeric chat ID (e.g. via @userinfobot,
+   or by messaging my new bot and calling getUpdates). Ask me for both values
+   and write them into ~/.claude/tg-hitl/.env, keeping it chmod 600.
+   NEVER print, log, or commit the token.
+4. Restart the daemon: launchctl kickstart -k gui/$(id -u)/com.$(id -un).tg-hitl-daemon
+   Verify it is alive: ~/.claude/tg-hitl/daemon.beat is fresh and
+   ~/.claude/tg-hitl/daemon.log has no errors.
+5. Merge the hooks from hooks-config.json into the "hooks" key of my
+   ~/.claude/settings.json. Preserve my existing hooks; show me the diff before
+   saving.
+6. Send a test notification: ~/.claude/tg-hitl/tg-ask.sh --notify "claude-tg-bridge is up"
+   and ask me to confirm it arrived in Telegram.
+7. Tell me how to enable tg-mode for a project (~/.claude/tg-hitl/tg-mode.sh on)
+   and remind me that hooks only apply to Claude Code sessions started AFTER this
+   setup — running sessions must be restarted.
+```
+
+### Option B — manual
+
+#### 1. Create a bot
 
 1. Message `@BotFather` on Telegram → `/newbot` → get the token.
 2. Get your chat ID: message `@userinfobot` or send a message to your bot then call
    `https://api.telegram.org/bot<TOKEN>/getUpdates`.
 
-### 2. Install
+#### 2. Install
 
 ```bash
 git clone https://github.com/DmitryBogd/claude-tg-bridge.git
@@ -87,24 +127,22 @@ Restart the daemon after editing `.env`:
 launchctl kickstart -k gui/$(id -u)/com.$(id -un).tg-hitl-daemon
 ```
 
-### 3. Add hooks to Claude Code settings
+#### 3. Add hooks to Claude Code settings
 
 Add the contents of `hooks-config.json` to the `"hooks"` key of your
 `~/.claude/settings.json`. See [hooks-config.json](hooks-config.json) for the
-full snippet.
+full snippet. Hooks apply only to sessions started after the change.
 
-### 4. Enable tg-mode for a project (optional)
+#### 4. Enable tg-mode for a project
 
 ```bash
 cd /path/to/your-project
 ~/.claude/tg-hitl/tg-mode.sh on
 ```
 
-Or enable globally (all projects) with away mode:
-```bash
-touch ~/.claude/tg-hitl/away          # enable
-rm   ~/.claude/tg-hitl/away           # disable
-```
+The per-project flag is the **only** switch. (Earlier versions also had a global
+"away" file; it was removed — two switches with OR logic made disabling
+confusing.)
 
 ## Usage
 
@@ -118,7 +156,7 @@ From a Claude agent:
 ```
 
 From Telegram (your phone):
-- `/sessions` — list active Claude sessions
+- `/sessions` — list active Claude sessions with live statuses
 - `/help` — quick reference
 - Reply to a bot message to route your text to the right session/question
 
@@ -148,6 +186,11 @@ tail -f ~/.claude/tg-hitl/daemon.log
 - Sessions opened **before** the hooks were installed are not in the registry
   (Claude Code snapshots hook config at session start) — restart them or re-apply
   via `/hooks`.
+- A fully idle session outside the park window cannot be "woken up" from Telegram —
+  there is no API to append to a live session; your message is queued in `inbox/`
+  and delivered at the end of the session's next turn.
+- macOS-only out of the box (launchd, BSD `stat`) — see
+  [Platform support](#platform-support).
 
 ## Security notes
 

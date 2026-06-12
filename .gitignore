@@ -12,7 +12,7 @@ sessions/
 inbox/
 parked/
 msgmap/
-away
+lastmirror/
 
 # Logs
 *.log

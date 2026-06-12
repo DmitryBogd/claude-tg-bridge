@@ -7,7 +7,7 @@
             "type": "command",
             "command": "\"$HOME/.claude/tg-hitl/tg-permission.sh\"",
             "timeout": 300,
-            "statusMessage": "Waiting for permission confirmation in Telegram (away mode)"
+            "statusMessage": "Waiting for permission confirmation in Telegram (tg-mode)"
           }
         ]
       }
