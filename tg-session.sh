@@ -213,6 +213,17 @@ name=$(basename "$cwd" 2>/dev/null || echo "")
 f="$SESSIONS/$sid"
 inbox="$INBOX/$sid"
 
+# cwd is sometimes missing from the hook event JSON (incident 2026-06-12: a Stop
+# right after auto-compaction -> tg_mode_on falsely "off" -> the mirror of the
+# final reply was silently skipped, the hook exited in 436 ms). Fall back to the
+# registry cwd; make the case visible in the log.
+if [ -z "$cwd" ] && [ -f "$f" ]; then
+  cwd=$(read_field cwd)
+  name=$(basename "$cwd" 2>/dev/null || echo "")
+  printf '%s %s: empty cwd in event JSON (sid=%.8s) - using registry value: %s\n' \
+    "$(date '+%F %T')" "$event" "$sid" "$cwd" >> "$DIR/daemon.log"
+fi
+
 # Structural filter: do NOT register sessions whose cwd is the home dir ($HOME).
 # Real working sessions always run inside a project dir; cwd=$HOME means headless/
 # eval sessions (Desktop cowork, `claude -p`, benchmarks) that start in bursts,
@@ -251,8 +262,16 @@ case "$event" in
       inject "$msg"
       exit 0
     fi
-    # 2) Outside tg-mode — a normal stop.
-    tg_mode_on || exit 0
+    # 2) Outside tg-mode — a normal stop. Tripwire: if the REGISTRY says the mode
+    # should be ON (the JSON cwd diverged from the registered one), skipping the
+    # mirror must be visible in the log, not silent (the 2026-06-12 incident class).
+    if ! tg_mode_on; then
+      rcwd=$(read_field cwd)
+      [ -n "$rcwd" ] && [ -f "$DIR/projects/$(printf '%s' "$rcwd" | sed 's#/#%#g')" ] && \
+        printf '%s stop: tg_mode OFF per JSON cwd (%s) but ON per registry (%s) - mirror skipped (sid=%.8s)\n' \
+          "$(date '+%F %T')" "$cwd" "$rcwd" "$sid" >> "$DIR/daemon.log"
+      exit 0
+    fi
     # 3) tg-mode: wait for the FINAL reply in the transcript and mirror it.
     # The final text flushes to the jsonl at the moment of Stop or a few seconds
     # later (incident: the mirror ran 0.3 s before the flush and picked up an
