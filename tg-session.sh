@@ -34,19 +34,54 @@ HOOK_BUDGET=1740                      # hard lifetime limit of the stop hook (60
 # ── Registry record ───────────────────────────────────────────────────────────
 read_field() { sed -n "s/^$1=//p" "$f" 2>/dev/null | head -1; }
 
+# Owning claude process (so the daemon can externally check liveness): walk up from
+# $PPID to the first ancestor whose comm contains lowercase "claude" (the CLI
+# native-binary; the Desktop "Claude" has a capital C and does NOT match — good).
+# Echo "<pid>\t<lstart>", where lstart (start time) pins process IDENTITY against
+# pid-reuse: a reused pid has a different lstart → the daemon honestly treats the
+# session as dead. Nothing = not found.
+_claude_proc() {
+  local p="${PPID:-0}" hop comm ls
+  for hop in 1 2 3 4 5 6; do
+    { [ -n "$p" ] && [ "$p" -gt 1 ] 2>/dev/null; } || break
+    comm=$(ps -p "$p" -o comm= 2>/dev/null)
+    case "$comm" in
+      # lstart is mandatory: without it pid-reuse can't be told apart, so an empty
+      # lstart (process vanished between the two ps calls) → emit NO pid at all
+      # (fail-safe: a pid-less record goes to the age-reaper, not to a wrong deletion
+      # of a live session with an empty pidstart).
+      *claude*) ls=$(ps -p "$p" -o lstart= 2>/dev/null | xargs); [ -n "$ls" ] && printf '%s\t%s' "$p" "$ls"; return 0 ;;
+    esac
+    p=$(ps -p "$p" -o ppid= 2>/dev/null | tr -d ' ')
+  done
+  return 0
+}
+
 # save_session <state> [stopped] — atomically rewrite the record, preserving
 # started and any fields absent in this hook call (tpath may be empty on start/end).
+# pid/pidstart are resolved on EVERY event (save_session is a fixed printf that does
+# not carry unknown fields; resolving each time avoids the Stop-rewrite wiping them).
+# Resolve miss → preserve the previous value (fail-safe: better to keep the old pid
+# than to wipe it and rely on the age-reaper alone).
 save_session() {
-  local nowts started stopped tp nm cw
+  local nowts started stopped tp nm cw proc pid pidstart
   nowts=$(date +%s)
   started=$(read_field started); [ -n "$started" ] || started=$nowts
   stopped="${2:-$(read_field stopped)}"
   tp="$tpath";  [ -n "$tp" ] || tp=$(read_field tpath)
   nm="$name";   [ -n "$nm" ] || nm=$(read_field name)
   cw="$cwd";    [ -n "$cw" ] || cw=$(read_field cwd)
-  printf 'name=%s\ncwd=%s\nstarted=%s\nlast=%s\nstate=%s\nstopped=%s\ntpath=%s\n' \
-    "$nm" "$cw" "$started" "$nowts" "$1" "$stopped" "$tp" > "$f.tmp.$$" \
+  proc=$(_claude_proc)
+  if [ -n "$proc" ]; then pid=${proc%%$'\t'*}; pidstart=${proc#*$'\t'}
+  else pid=$(read_field pid); pidstart=$(read_field pidstart); fi
+  printf 'name=%s\ncwd=%s\nstarted=%s\nlast=%s\nstate=%s\nstopped=%s\ntpath=%s\npid=%s\npidstart=%s\n' \
+    "$nm" "$cw" "$started" "$nowts" "$1" "$stopped" "$tp" "$pid" "$pidstart" > "$f.tmp.$$" \
     && mv "$f.tmp.$$" "$f"
+  # Observability on ALL events (not just start): if the record ends up pid-less the
+  # walk-up found no claude ancestor → liveness-reaping is disabled for it (age-reaper
+  # only). A systematic miss (a new launch model) must be visible in the log.
+  [ -z "$pid" ] && printf '%s session-register: no claude ancestor for %s (cwd=%s)\n' \
+    "$(date '+%F %T')" "$sid" "$cw" >> "$DIR/daemon.log"
 }
 
 # ── Telegram ──────────────────────────────────────────────────────────────────

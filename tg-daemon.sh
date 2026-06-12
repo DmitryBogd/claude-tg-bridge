@@ -141,30 +141,41 @@ live_parks() {
   echo "$n $hit"
 }
 
-# Remove dead sessions TOGETHER with their leftovers; a queue nobody will ever
-# take is honestly bounced back to TG. Two activity thresholds (max of last and
-# transcript mtime):
-#   • any record >12 h — stale;
-#   • state=running with no live park >6 h — dead "running" (crash/SIGKILL, or a
-#     headless `claude -p` that exited without SessionEnd). 6 h is headroom over
-#     the longest real turn, so a live long-running session is never touched.
-RUNNING_REAP=21600   # 6 h
+# Remove dead sessions TOGETHER with their leftovers; a queue nobody will ever take
+# is honestly bounced back to TG. PRIMARY signal — owning-process liveness (pid+
+# pidstart written by the hook): a session is dead if the process is gone OR the pid
+# was reused (lstart differs). A live process → KEEP regardless of age (a session
+# working for a full day is valid). The age-reaper stays as BACKSTOP for old-format
+# records with no pid:
+#   • any record >12 h; or state=running >6 h (crash without SessionEnd).
+# Fail-safe: when unsure, do NOT delete (empty pid / pid still claude → keep).
+RUNNING_REAP=21600   # 6 h (only for records without a pid)
 prune_sessions() {
-  local now f sid last state tp act pend tm
+  local now f sid last state tp act pend tm pid pidstart cur
   now=$(date +%s)
   shopt -s nullglob
   for f in "$SESSIONS"/*; do
     [ -f "$f" ] || continue
     sid=$(basename "$f")
+    case "$sid" in *.tmp.*) continue ;; esac   # half-written tmp (SIGKILL mid-write) — not a record
     park_alive "$sid" && continue          # live park — never touch
-    last=$(field "$f" last); [ -n "$last" ] || last=0
-    state=$(field "$f" state)
-    tp=$(field "$f" tpath)
-    act=$last
-    [ -n "$tp" ] && [ -f "$tp" ] && { tm=$(fmtime "$tp"); [ "$tm" -gt "$act" ] && act=$tm; }
-    if [ $(( now - act )) -gt 43200 ]; then :
-    elif [ "$state" = "running" ] && [ $(( now - act )) -gt "$RUNNING_REAP" ]; then :
-    else continue
+    pid=$(field "$f" pid); pidstart=$(field "$f" pidstart)
+    if [ -n "$pid" ] && [ -n "$pidstart" ]; then
+      cur=$(ps -p "$pid" -o lstart= 2>/dev/null | xargs)
+      # process alive AND the SAME one (lstart matched) → keep, regardless of age
+      [ -n "$cur" ] && [ "$cur" = "$pidstart" ] && continue
+      # else: process gone or pid reused → dead, removed below
+    else
+      # no pid OR no pidstart (old format / empty resolve) → age-reaper.
+      # An empty pidstart is NOT treated as "process changed" — that's fail-safe (keep).
+      last=$(field "$f" last); [ -n "$last" ] || last=0
+      state=$(field "$f" state)
+      tp=$(field "$f" tpath); act=$last
+      [ -n "$tp" ] && [ -f "$tp" ] && { tm=$(fmtime "$tp"); [ "$tm" -gt "$act" ] && act=$tm; }
+      if [ $(( now - act )) -gt 43200 ]; then :
+      elif [ "$state" = "running" ] && [ $(( now - act )) -gt "$RUNNING_REAP" ]; then :
+      else continue
+      fi
     fi
     pend=$( { cat "$INBOX/$sid.taken" 2>/dev/null; cat "$INBOX/$sid" 2>/dev/null; } )
     [ -n "$pend" ] && say "⚠️ [$(field "$f" name)] session is inactive and was removed — NOT delivered: ${pend:0:500}"
@@ -184,6 +195,7 @@ build_sessions_list() {
   shopt -s nullglob
   for f in "$SESSIONS"/*; do
     [ -f "$f" ] || continue
+    case "$(basename "$f")" in *.tmp.*) continue ;; esac   # half-written tmp — don't show
     name=$(esc "$(field "$f" name)")
     cwd=$(esc "$(field "$f" cwd)")
     last=$(field "$f" last); [ -n "$last" ] || last=$now
@@ -368,8 +380,22 @@ while true; do
   touch "$BEAT"
   now=$(date +%s)
   if [ $(( now - LAST_SWEEP )) -gt 3600 ]; then
+    # Proactive: dead sessions get cleaned even without a /sessions command. NB: a
+    # mass reap with non-empty queues can briefly stall the poll (say→curl up to 15s
+    # per chunk, serially, before this iteration's getUpdates) — rare, acceptable
+    # (queues are usually empty).
+    prune_sessions
     find "$MSGMAP" -type f -mmin +2880 -delete 2>/dev/null || true
     find "$PARKED" -type f -mmin +3 -delete 2>/dev/null || true
+    # pending/answers (the tg-ask queue) are normally cleaned by tg-ask itself; but a
+    # SIGKILL before its cleanup trap leaves an orphan forever. Questions time out at
+    # 24h, so >48h is definitely dead. Closes a slow leak.
+    find "$PENDING" -type f -mmin +2880 -delete 2>/dev/null || true
+    find "$ANSWERS" -type f -mmin +2880 -delete 2>/dev/null || true
+    # Orphaned tmp (SIGKILL in the ~ms window between printf and mv in the hook/daemon)
+    # has no age-sweep of its own and would show as a junk row in /sessions. >60min =
+    # definitely abandoned.
+    find "$SESSIONS" -name '*.tmp.*' -mmin +60 -delete 2>/dev/null || true
     # daemon.log is both launchd stdout/stderr and the sendMessage-failure log;
     # cap at ~1MB → keep the last 500 lines. COPYTRUNCATE (cat > file, not mv):
     # preserves the inode, so the launchd fd (O_APPEND) stays valid and never
