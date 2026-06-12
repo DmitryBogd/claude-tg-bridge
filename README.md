@@ -23,6 +23,12 @@ away from the computer.
   inject it into the session and continue; replying to the same anchor twice works,
   and you can address any session without a reply via a `#s<first 8 hex of id>` tag.
 
+- **Background-agent wake** — if a background agent (Agent tool) finishes while its
+  parent session is parked, the `SubagentStop` hook drops a wake marker and the park
+  exits immediately, so the session processes the agent's result right away instead
+  of waiting out the park window (up to 25 min). Stale markers from agents that
+  finished mid-turn are discarded on the next `Stop`.
+
 - **`/sessions`** — bot command listing all active Claude sessions with live status:
   🟢 working (turn in progress, by transcript mtime) · 😴 parked, waiting for your
   reply · ✅ finished its turn N min ago · 🟡 possibly interrupted (Esc fires no

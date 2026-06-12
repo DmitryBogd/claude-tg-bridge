@@ -21,8 +21,9 @@ INBOX="$DIR/inbox"
 PARKED="$DIR/parked"
 MSGMAP="$DIR/msgmap"
 LASTMIRROR="$DIR/lastmirror"   # hash of the last mirrored reply per session (dedup)
+WAKE="$DIR/wake"               # "a background agent finished" markers → wake the park
 OUTBOX="$DIR/outbox"           # undelivered TG messages — the daemon resends them
-mkdir -p "$SESSIONS" "$INBOX" "$PARKED" "$MSGMAP" "$LASTMIRROR" "$OUTBOX"
+mkdir -p "$SESSIONS" "$INBOX" "$PARKED" "$MSGMAP" "$LASTMIRROR" "$OUTBOX" "$WAKE"
 [ -f "$DIR/.env" ] && . "$DIR/.env"
 API="${TG_API_BASE:-https://api.telegram.org}/bot${TG_TOKEN:-}"
 
@@ -242,14 +243,35 @@ case "$event" in
     esac
     ;;
   beat) save_session running ;;
+  subagentstop)
+    # A background agent finished. If the session is parked, its task notification
+    # would wait for the park to end (up to 25 min). The wake marker tells the park
+    # loop to exit immediately: the turn ends, the harness delivers the notification,
+    # the session processes the result and mirrors to TG again. Outside tg-mode
+    # there is nothing to wake.
+    if tg_mode_on; then
+      touch "$WAKE/$sid"
+      printf '%s subagentstop: wake marker (sid=%.8s, parked=%s)\n' \
+        "$(date '+%F %T')" "$sid" "$([ -f "$PARKED/$sid" ] && echo yes || echo no)" >> "$DIR/daemon.log"
+    fi
+    ;;
   end)
     # A queue nobody will ever take — honestly bounce it to TG, don't silently drop.
     pend=$( { cat "$inbox.taken" 2>/dev/null; cat "$inbox" 2>/dev/null; } )
     [ -n "$pend" ] && tg "⚠️ [$name] session closed — NOT delivered: ${pend:0:500}"
-    rm -f "$f" "$inbox" "$inbox.taken" "$inbox".merge.* "$PARKED/$sid" "$LASTMIRROR/$sid"
+    rm -f "$f" "$inbox" "$inbox.taken" "$inbox".merge.* "$PARKED/$sid" "$LASTMIRROR/$sid" "$WAKE/$sid"
     ;;
   stop)
     save_session idle "$ENTRY_TS"   # the turn ended the moment we entered the hook
+    # A wake marker older than hook entry (with slack) is from an agent that finished
+    # MID-turn: the session already received its result, nothing to wake for. A fresh
+    # one (agent finished right at the turn boundary — its notification is still
+    # queued) is kept: the park exits at once and the notification is delivered
+    # without the 25-minute wait.
+    if [ -f "$WAKE/$sid" ] && \
+       [ "$(stat -f %m "$WAKE/$sid" 2>/dev/null || echo 0)" -lt $(( ENTRY_TS - 5 )) ]; then
+      rm -f "$WAKE/$sid"
+    fi
     # 0) Recover an orphaned .taken (the hook was killed between mv and cat last time).
     # The trailing ":" in the group is mandatory: without it the group's rc = rc of
     # the last cat (inbox is usually absent) and the mv after && would never run.
@@ -339,6 +361,16 @@ $rep
       if msg=$(take_inbox); then
         park_is_ours && rm -f "$PARKED/$sid"
         inject "$msg"
+        exit 0
+      fi
+      # A background agent finished (SubagentStop → wake marker): leave the park
+      # WITHOUT injecting — the turn ends and the harness delivers the task
+      # notification immediately.
+      if [ -f "$WAKE/$sid" ]; then
+        rm -f "$WAKE/$sid"
+        park_is_ours && rm -f "$PARKED/$sid"
+        printf '%s stop: park woken by wake marker (sid=%.8s)\n' \
+          "$(date '+%F %T')" "$sid" >> "$DIR/daemon.log"
         exit 0
       fi
       # Daemon down longer than ~60 s → don't hang silently (KeepAlive usually
